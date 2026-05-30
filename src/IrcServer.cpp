@@ -39,7 +39,8 @@ void IrcServer::setupSocket()
 	if (_listenFd == -1)
 		throw std::runtime_error("socket");
 	int yes = 1;
-	setsockopt(_listenFd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+	if (setsockopt(_listenFd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) == -1)
+		throw std::runtime_error("setsockopt");
 	int flags = fcntl(_listenFd, F_GETFL, 0);
 	if (flags == -1 || fcntl(_listenFd, F_SETFL, flags | O_NONBLOCK) == -1)
 		throw std::runtime_error("fcntl");
@@ -124,7 +125,7 @@ void IrcServer::acceptClient()
 		Client *client = new Client();
 		client->fd = fd;
 		_clients[fd] = client;
-		queueMessage(*client, ":ft_irc NOTICE * :Welcome to ft_irc\r\n");
+		queueMessage(*client, prefixForServer() + " NOTICE * :Welcome to ft_irc\r\n");
 	}
 }
 
@@ -300,8 +301,11 @@ bool IrcServer::isChannelName(const std::string &target)
 
 std::string IrcServer::prefixFor(const Client &client)
 {
-	std::string nick = client.nickSet ? client.nick : "*";
-	std::string user = client.userSet ? client.user : "*";
+	return prefixForIdentity(client.nickSet ? client.nick : "*", client.userSet ? client.user : "*");
+}
+
+std::string IrcServer::prefixForIdentity(const std::string &nick, const std::string &user)
+{
 	return ":" + nick + "!" + user + "@localhost";
 }
 
@@ -434,7 +438,8 @@ void IrcServer::cmdNick(Client &client, const std::vector<std::string> &args)
 		sendError(client, "431", ":No nickname given");
 		return;
 	}
-	if (findClientByNick(args[1]) && (!client.nickSet || client.nick != args[1]))
+	bool isNickTaken = (findClientByNick(args[1]) && (!client.nickSet || client.nick != args[1]));
+	if (isNickTaken)
 	{
 		sendError(client, "433", args[1] + " :Nickname is already in use");
 		return;
@@ -449,7 +454,7 @@ void IrcServer::cmdNick(Client &client, const std::vector<std::string> &args)
 	}
 	if (oldNick.empty() || oldNick == client.nick)
 		return;
-	std::string msg = prefixFor(client) + " NICK :" + client.nick + "\r\n";
+	std::string msg = prefixForIdentity(oldNick, client.userSet ? client.user : "*") + " NICK :" + args[1] + "\r\n";
 	for (std::set<std::string>::iterator it = client.joinedChannels.begin(); it != client.joinedChannels.end(); ++it)
 	{
 		Channel *channel = findChannel(*it);
@@ -539,8 +544,17 @@ void IrcServer::cmdJoin(Client &client, const std::vector<std::string> &args)
 		sendError(client, "461", "JOIN :Not enough parameters");
 		return;
 	}
+	std::vector<std::string> keys;
+	if (args.size() >= 3)
+	{
+		std::stringstream keyStream(args[2]);
+		std::string key;
+		while (std::getline(keyStream, key, ','))
+			keys.push_back(key);
+	}
 	std::stringstream ss(args[1]);
 	std::string channelName;
+	std::size_t index = 0;
 	while (std::getline(ss, channelName, ','))
 	{
 		if (!isChannelName(channelName))
@@ -548,9 +562,10 @@ void IrcServer::cmdJoin(Client &client, const std::vector<std::string> &args)
 			sendError(client, "403", channelName + " :No such channel");
 			continue;
 		}
-		std::string key = args.size() >= 3 ? args[2] : "";
 		Channel &channel = getOrCreateChannel(channelName);
+		const std::string key = index < keys.size() ? keys[index] : "";
 		joinChannel(client, channel, key);
+		++index;
 	}
 }
 
@@ -561,7 +576,10 @@ void IrcServer::partChannel(Client &client, Channel &channel, const std::string 
 		sendError(client, "442", channel.name + " :You're not on that channel");
 		return;
 	}
-	broadcastToChannel(channel, prefixFor(client) + " PART " + channel.name + " :" + message + "\r\n");
+	if (message.empty())
+		broadcastToChannel(channel, prefixFor(client) + " PART " + channel.name + "\r\n");
+	else
+		broadcastToChannel(channel, prefixFor(client) + " PART " + channel.name + " :" + message + "\r\n");
 	channel.members.erase(&client);
 	channel.operators.erase(&client);
 	channel.invited.erase(&client);
@@ -576,7 +594,7 @@ void IrcServer::cmdPart(Client &client, const std::vector<std::string> &args)
 		sendError(client, "461", "PART :Not enough parameters");
 		return;
 	}
-	std::string msg = args.size() >= 3 ? args[2] : client.nick;
+	std::string msg = args.size() >= 3 ? joinTokens(args, 2) : "";
 	std::stringstream ss(args[1]);
 	std::string channelName;
 	while (std::getline(ss, channelName, ','))
@@ -680,7 +698,7 @@ void IrcServer::cmdTopic(Client &client, const std::vector<std::string> &args)
 	}
 	if (channel->topicProtected && channel->operators.find(&client) == channel->operators.end())
 	{
-		sendError(client, "482", channel->name + " :You're not channel operator");
+		sendError(client, "482", channel->name + " :You're not a channel operator");
 		return;
 	}
 	channel->topic = args[2];
@@ -713,8 +731,16 @@ void IrcServer::applyChannelMode(Channel &channel, Client &actor, char sign, cha
 		case 'l':
 			if (sign == '+')
 			{
+				char *end = NULL;
+				errno = 0;
+				unsigned long value = std::strtoul(param.c_str(), &end, 10);
+				if (errno == ERANGE || !end || *end != '\0' || value == 0)
+				{
+					sendError(actor, "461", "MODE :Invalid limit");
+					return;
+				}
+				channel.limit = static_cast<std::size_t>(value);
 				channel.hasLimit = true;
-				channel.limit = static_cast<std::size_t>(std::atoi(param.c_str()));
 			}
 			else
 			{
@@ -734,19 +760,18 @@ void IrcServer::applyChannelMode(Channel &channel, Client &actor, char sign, cha
 			break;
 		}
 		default:
-			(void)actor;
 			break;
 	}
 }
 
 void IrcServer::setChannelMode(Channel &channel, Client &actor, const std::string &modeString, const std::vector<std::string> &params)
 {
-	if (channel.members.find(&actor) == channel.members.end() || channel.operators.find(&actor) == channel.operators.end())
+	if (channel.operators.find(&actor) == channel.operators.end())
 	{
-		sendError(actor, "482", channel.name + " :You're not channel operator");
+		sendError(actor, "482", channel.name + " :You're not a channel operator");
 		return;
 	}
-	char sign = 0;
+	char sign = '+';
 	std::size_t paramIndex = 0;
 	for (std::size_t i = 0; i < modeString.size(); ++i)
 	{
@@ -757,7 +782,7 @@ void IrcServer::setChannelMode(Channel &channel, Client &actor, const std::strin
 			continue;
 		}
 		std::string param;
-		if (c == 'k' || c == 'l' || c == 'o')
+		if ((c == 'k' && sign == '+') || (c == 'l' && sign == '+') || c == 'o')
 		{
 			if (paramIndex >= params.size())
 				break;
@@ -810,7 +835,7 @@ void IrcServer::cmdKick(Client &client, const std::vector<std::string> &args)
 	}
 	if (channel->operators.find(&client) == channel->operators.end())
 	{
-		sendError(client, "482", channel->name + " :You're not channel operator");
+		sendError(client, "482", channel->name + " :You're not a channel operator");
 		return;
 	}
 	if (channel->members.find(target) == channel->members.end())
@@ -839,7 +864,7 @@ void IrcServer::cmdInvite(Client &client, const std::vector<std::string> &args)
 	}
 	if (channel->operators.find(&client) == channel->operators.end())
 	{
-		sendError(client, "482", channel->name + " :You're not channel operator");
+		sendError(client, "482", channel->name + " :You're not a channel operator");
 		return;
 	}
 	channel->invited.insert(target);

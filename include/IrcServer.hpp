@@ -96,6 +96,7 @@ private:
 	static std::string trimCRLF(const std::string &line);
 	static std::string toUpper(std::string value);
 	static bool isChannelName(const std::string &target);
+	static std::string prefixForIdentity(const std::string &nick, const std::string &user);
 	static std::string prefixFor(const Client &client);
 	static std::string prefixForServer();
 	static std::string intToString(int value);
